@@ -42,6 +42,10 @@ dependencies = [
 tpu = [
     "jax[tpu]>=0.10.1",
 ]
+# Needed only to read/write Orbax checkpoints on gs:// (orbax/etils use fsspec).
+gcs = [
+    "gcsfs>=2024.0.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/huckiyang/jax-nemotron"
