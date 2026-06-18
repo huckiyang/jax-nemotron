@@ -322,6 +322,7 @@ def convert(
     preset: str,
     dtype: str,
     dry_run: bool = False,
+    overwrite: bool = False,
 ) -> dict:
     """Run the full target-driven conversion of the LLM backbone.
 
@@ -441,7 +442,9 @@ def convert(
         ckpter = ocp.StandardCheckpointer()
         # Wrap under "params" so the runtime loads model.init's {"params": ...}
         # shape. (Loaders auto-classify the nested tree; see playbook.)
-        ckpter.save(dest, {"params": params})
+        # force=overwrite lets a re-run replace an existing checkpoint instead of
+        # failing with "Destination ... already exists."
+        ckpter.save(dest, {"params": params}, force=overwrite)
         ckpter.wait_until_finished()
         print(f"[convert] WROTE checkpoint to {dest!r}")
     else:
@@ -481,6 +484,9 @@ def _parse_args(argv=None):
                    help="Cast dtype. Only 'bf16' supported (f32 30B tree OOMs).")
     p.add_argument("--dry-run", action="store_true",
                    help="Read/transform/assert every leaf but do NOT write Orbax.")
+    p.add_argument("--overwrite", action="store_true",
+                   help="Overwrite the destination if an Orbax checkpoint already "
+                        "exists there (else the write fails on an existing --out).")
     return p.parse_args(argv)
 
 
@@ -492,6 +498,7 @@ def main(argv=None):
         preset=args.preset,
         dtype=args.dtype,
         dry_run=args.dry_run,
+        overwrite=args.overwrite,
     )
     print("\n========== MANIFEST ==========")
     print(json.dumps(manifest, indent=2))
