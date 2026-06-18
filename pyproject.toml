@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jax-nemotron"
+version = "0.1.0"
+description = "A public, Karpathy-style JAX/Flax (NNX) reimplementation of NVIDIA Nemotron-3-Nano-Omni, with HF safetensors to Orbax conversion."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "huckiyang" }]
+keywords = ["jax", "flax", "nnx", "nemotron", "mamba", "moe", "orbax", "llm"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: Apache Software License",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Runtime deps the model + converter import. Versions are pinned to the floor of
+# what the project venv has confirmed working (jax 0.10.1, flax 0.12.7, etc.) but
+# kept open on the upper bound to stay permissive for Colab/Kaggle TPU installs.
+dependencies = [
+    "jax>=0.10.1",
+    "flax>=0.12.0",
+    "optax>=0.2.0",
+    "orbax-checkpoint>=0.12.0",
+    "transformers>=4.40.0",
+    "safetensors>=0.8.0",
+    "ml_dtypes>=0.5.0",
+    "numpy>=1.26.0",
+]
+
+[project.optional-dependencies]
+# TPU extra for Colab/Kaggle. The libtpu wheels live on Google's index, so an
+# install needs the extra find-links, e.g.:
+#   pip install -e ".[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+tpu = [
+    "jax[tpu]>=0.10.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/huckiyang/jax-nemotron"
+Repository = "https://github.com/huckiyang/jax-nemotron"
+
+[tool.setuptools]
+# src-layout: the importable package lives under src/jax_nemotron.
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

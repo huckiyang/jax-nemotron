@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Local dev guidance — contains internal/infra notes, not for the public repo
+CLAUDE.md
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Scratch / local artifacts
+/tmp/
+*.log
+_dryrun/
