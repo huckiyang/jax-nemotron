@@ -2,7 +2,7 @@
 
 <img src="jn.png" alt="JAX Nemotron Logo" width="200"/>
 
-A clean, hackable JAX / Flax-NNX re-implementation of NVIDIA's **Nemotron-3-Nano-Omni** model based on public model files and paper.
+A clean, hackable JAX / Flax-NNX re-implementation of NVIDIA's **Nemotron-3-Nano-Omni** model based on public pytorch model files and paper.
 
 The backbone is a hybrid LLM: interleaved **Mamba-2** state-space mixers, **GQA attention**, and
 **sparse-MoE** FFNs (the `"MEM*EM"`-style layer pattern). On top of that backbone sit a **vision
