@@ -125,29 +125,32 @@ class VisionProjector(nnx.Module):
 
 class SoundProjector(nnx.Module):
     """
-    Sound projector matching the HF ``sound_projection`` adapter.
+    Sound projector matching the HF ``sound_projection`` adapter (audio_model.py
+    ``SoundProjection``).
 
-    HF ``sound_projection`` is a (linear1 -> norm -> linear2) stack:
-        sound_projection.linear1.weight : Linear(sound_hidden -> mid)
-        sound_projection.norm.weight    : RMSNorm(mid)
-        sound_projection.linear2.weight : Linear(mid -> llm_hidden)
-    Activation between is SiLU (omni ground-truth note: "SiLU between layers").
+    HF forward order is **norm -> linear1 -> SquaredReLU -> linear2**, where the
+    RMSNorm acts on the encoder's *input* width (1024), NOT the mid width:
+        sound_projection.norm.weight    : RMSNorm(sound_hidden)   weight (1024,)
+        sound_projection.linear1.weight : Linear(sound_hidden -> mid)  (4096,1024)
+        sound_projection.linear2.weight : Linear(mid -> llm_hidden)    (2688,4096)
+    No bias (projection_bias=false). Activation between is squared-ReLU.
 
         in_dim  = sound hidden_size (real: 1024)
-        mid_dim = projector mid width
+        mid_dim = projection_hidden_size (real: 4096)
         out_dim = llm hidden_size (real: 2688)
     """
 
     def __init__(self, rngs: nnx.Rngs, in_dim: int, mid_dim: int, out_dim: int, eps: float):
+        # Plain RMSNorm scale over the INPUT width (HF sound_projection.norm.weight,
+        # shape (in_dim,)). nnx.RMSNorm is plain scale * normed, matching HF.
+        self.norm = nnx.RMSNorm(in_dim, epsilon=eps, rngs=rngs)
         self.linear1 = nnx.Linear(in_dim, mid_dim, use_bias=False, rngs=rngs)
-        # Plain RMSNorm scale (HF sound_projection.norm.weight). nnx.RMSNorm is
-        # plain scale * normed, matching the HF convention.
-        self.norm = nnx.RMSNorm(mid_dim, epsilon=eps, rngs=rngs)
         self.linear2 = nnx.Linear(mid_dim, out_dim, use_bias=False, rngs=rngs)
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        h = jax.nn.silu(self.linear1(x))
-        h = self.norm(h)
+        h = self.norm(x)
+        h = self.linear1(h)
+        h = _relu2(h)                       # squared-ReLU
         return self.linear2(h)
 
 
@@ -256,12 +259,18 @@ class NemotronOmniConfig:
             sound = AudioEncoderConfig(
                 sample_rate=16000,
                 n_mels=128,             # num_mel_bins
+                n_fft=512,
+                frame_length=400,
+                hop_length=160,
                 hidden_dim=1024,
                 num_heads=8,
                 head_dim=128,           # 1024 / 8
                 num_layers=24,
-                ffn_dim=1024 * 4,
-                conv_kernel_size=31,
+                ffn_dim=4096,           # intermediate_size
+                conv_kernel_size=9,     # depthwise conv (NOT 31)
+                subsampling_conv_channels=256,
+                subsampling_conv_kernel=3,
+                subsampling_factor=8,
                 proj_dim=1024,          # body output stays in sound_hidden
             )
             cfg = cls(
@@ -269,7 +278,7 @@ class NemotronOmniConfig:
                 vision=vision,
                 sound=sound,
                 vision_projector_hidden=20480,
-                sound_projector_hidden=2688,
+                sound_projector_hidden=4096,    # projection_hidden_size
                 img_context_token_id=DEFAULT_IMG_CONTEXT_TOKEN_ID,
                 sound_context_token_id=DEFAULT_SOUND_CONTEXT_TOKEN_ID,
             )
@@ -291,7 +300,7 @@ class NemotronOmniConfig:
                 proj_dim=32,            # body output in vit_hidden=32
                 teachers=[],
             )
-            # Tiny Conformer.
+            # Tiny Conformer (exercises one of every submodule type).
             sound = AudioEncoderConfig(
                 sample_rate=16000,
                 n_mels=16,
@@ -303,7 +312,10 @@ class NemotronOmniConfig:
                 head_dim=8,
                 num_layers=2,
                 ffn_dim=64,
-                conv_kernel_size=7,
+                conv_kernel_size=5,
+                subsampling_conv_channels=8,
+                subsampling_conv_kernel=3,
+                subsampling_factor=8,
                 proj_dim=32,
             )
             cfg = cls(

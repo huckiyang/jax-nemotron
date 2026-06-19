@@ -38,6 +38,7 @@ from scripts.convert_hf_to_orbax import (
     transform_raw,
     transform_T,
     transform_conv,
+    transform_conv2d,
     transform_stackT,
     apply_transform,
     BF16,
@@ -93,6 +94,26 @@ def test_transform_conv():
     if not np.array_equal(out, np.transpose(a, (2, 1, 0))):
         _fail("conv must be a (2,1,0) transpose")
     print("[unit] conv OK")
+
+
+def test_transform_conv2d():
+    # PyTorch Conv2d depthwise (out_ch, in/groups=1, kH, kW) -> nnx (kH, kW, 1, out_ch).
+    out_ch, kh, kw = 256, 3, 3
+    a = np.arange(out_ch * 1 * kh * kw, dtype=np.float32).reshape(out_ch, 1, kh, kw)
+    out = transform_conv2d([a])
+    if out.shape != (kh, kw, 1, out_ch):
+        _fail(f"conv2d depthwise shape {out.shape} != {(kh, kw, 1, out_ch)}")
+    if not np.array_equal(out, np.transpose(a, (2, 3, 1, 0))):
+        _fail("conv2d must be a (2,3,1,0) transpose")
+    # PyTorch Conv2d pointwise (out_ch, in_ch, 1, 1) -> nnx (1, 1, in_ch, out_ch).
+    out_ch, in_ch = 256, 256
+    b = np.arange(out_ch * in_ch, dtype=np.float32).reshape(out_ch, in_ch, 1, 1)
+    ob = transform_conv2d([b])
+    if ob.shape != (1, 1, in_ch, out_ch):
+        _fail(f"conv2d pointwise shape {ob.shape} != {(1, 1, in_ch, out_ch)}")
+    if not np.array_equal(ob, np.transpose(b, (2, 3, 1, 0))):
+        _fail("conv2d pointwise must be a (2,3,1,0) transpose")
+    print("[unit] conv2d OK")
 
 
 def test_transform_stackT():
@@ -299,6 +320,7 @@ def main():
     test_transform_raw()
     test_transform_T()
     test_transform_conv()
+    test_transform_conv2d()
     test_transform_stackT()
     test_stackT_rejects_ragged()
     test_apply_transform_dispatch_and_unknown()

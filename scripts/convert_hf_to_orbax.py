@@ -156,6 +156,19 @@ def transform_conv(arrays: list[np.ndarray]) -> np.ndarray:
     return np.ascontiguousarray(np.transpose(a, (2, 1, 0)))
 
 
+def transform_conv2d(arrays: list[np.ndarray]) -> np.ndarray:
+    """PyTorch Conv2d (out_ch, in_ch/groups, kH, kW) -> nnx.Conv kernel
+    (kH, kW, in_ch/groups, out_ch). Transpose axes (0,1,2,3) -> (2,3,1,0).
+
+    Used by the sound subsampling 2-D conv stack: depthwise stages have
+    in_ch/groups == 1 (e.g. (256,1,3,3) -> (3,3,1,256)); pointwise stages have
+    kH==kW==1 (e.g. (256,256,1,1) -> (1,1,256,256))."""
+    assert len(arrays) == 1, f"conv2d expects exactly one source, got {len(arrays)}"
+    a = arrays[0]
+    assert a.ndim == 4, f"conv2d expects a 4-D array, got shape {a.shape}"
+    return np.ascontiguousarray(np.transpose(a, (2, 3, 1, 0)))
+
+
 def transform_stackT(arrays: list[np.ndarray]) -> np.ndarray:
     """Transpose each 2-D source (out,in)->(in,out) and stack on a new axis 0,
     giving (N, in, out). N may be 1 (shared expert)."""
@@ -172,6 +185,7 @@ _TRANSFORMS: dict[str, Callable[[list[np.ndarray]], np.ndarray]] = {
     "raw": transform_raw,
     "T": transform_T,
     "conv": transform_conv,
+    "conv2d": transform_conv2d,
     "stackT": transform_stackT,
 }
 
@@ -235,6 +249,43 @@ def build_target_tree(preset: str):
     for path, leaf in leaves.items():
         val = getattr(leaf, "value", leaf)
         targets[path] = tuple(val.shape)
+    return cfg, targets
+
+
+def build_sound_target_tree(preset: str):
+    """Return (omni_config, {slash_path -> tuple(shape)}) for the SOUND
+    namespace: the faithful AudioEncoder (paths prefixed ``sound_encoder/``) and
+    the SoundProjector (prefixed ``sound_projection/``), via nnx.eval_shape so NO
+    real arrays are allocated. Paths match the keys of ``hf_sound_name_map``."""
+    import jax  # noqa: F401
+    from flax import nnx
+
+    from jax_nemotron.audio_encoder import AudioEncoder
+    from jax_nemotron.nemotron_omni import NemotronOmniConfig, SoundProjector
+
+    cfg = NemotronOmniConfig.from_preset(preset)
+    cfg.validate()
+
+    def init_encoder():
+        return AudioEncoder(cfg.sound, rngs=nnx.Rngs(0))
+
+    def init_projector():
+        return SoundProjector(
+            rngs=nnx.Rngs(1),
+            in_dim=cfg.sound_proj_in,
+            mid_dim=cfg.sound_projector_hidden,
+            out_dim=cfg.llm.hidden_size,
+            eps=cfg.llm.norm_eps,
+        )
+
+    targets: dict = {}
+    for init_fn, prefix in ((init_encoder, "sound_encoder/"),
+                            (init_projector, "sound_projection/")):
+        abstract = nnx.eval_shape(init_fn)
+        _, abstract_state = nnx.split(abstract)
+        for path, leaf in _flatten_state_paths(abstract_state).items():
+            val = getattr(leaf, "value", leaf)
+            targets[prefix + path] = tuple(val.shape)
     return cfg, targets
 
 
@@ -316,6 +367,76 @@ def _insert(tree: dict, slash_path: str, value) -> None:
 # =============================================================================
 
 
+def _build_params(
+    targets: dict,
+    name_map: dict,
+    store: "ShardedSafetensors",
+    hf_prefix: str,
+    hf_keyset: set,
+    cast_dtype,
+    dry_run: bool,
+) -> tuple[dict, list, list, dict, int]:
+    """Build the Orbax param tree leaf-by-leaf from a (targets, name_map) pair.
+
+    Shared by the LLM and sound namespaces — the only differences are the
+    target tree, the name map, and the HF prefix ("" for sound). Returns
+    (params, written, unmapped_targets, consumed_hf, total_bytes). Consumption is
+    tracked against ``hf_keyset`` (the namespace's HF keys) so double-claims and
+    missing sources are caught the same way for both paths."""
+    params: dict = {}
+    written: list = []
+    unmapped_targets: list = []
+    consumed_hf: dict[str, str] = {}
+    total_bytes = 0
+
+    for tpath, tshape in targets.items():
+        entry = name_map.get(tpath)
+        if entry is None:
+            # nnx may emit a trailing variable-kind segment on some leaves; the
+            # name map keys to the un-trailed path. Try the trimmed form.
+            trimmed = "/".join(tpath.split("/")[:-1])
+            entry = name_map.get(trimmed)
+        if entry is None:
+            unmapped_targets.append(tpath)
+            continue
+
+        hf = entry["hf"]
+        transform = entry["transform"]
+        rel_names = [hf] if isinstance(hf, str) else list(hf)
+        full_names = [hf_prefix + n for n in rel_names]
+
+        arrays = []
+        for fn in full_names:
+            if fn not in store:
+                raise KeyError(
+                    f"target {tpath!r} needs HF tensor {fn!r}, absent from "
+                    f"checkpoint index (shape expected from config: {tshape})"
+                )
+            if fn in consumed_hf:
+                raise ValueError(
+                    f"HF tensor {fn!r} double-claimed by {consumed_hf[fn]!r} and "
+                    f"{tpath!r}"
+                )
+            consumed_hf[fn] = tpath
+            # Dry-run validates name-map membership against the index only; it must
+            # NOT read tensor data (the index-only checkpoint has no shards on disk).
+            if not dry_run:
+                arrays.append(store.get(fn))
+
+        if not dry_run:
+            arr = apply_transform(transform, arrays)
+            assert tuple(arr.shape) == tuple(tshape), (
+                f"{tpath}: converted shape {tuple(arr.shape)} != target {tuple(tshape)} "
+                f"(transform={transform}, sources={full_names})"
+            )
+            arr = arr.astype(cast_dtype)
+            total_bytes += arr.nbytes
+            _insert(params, tpath, arr)
+        written.append(tpath)
+
+    return params, written, unmapped_targets, consumed_hf, total_bytes
+
+
 def convert(
     ckpt_dir: str,
     out: str,
@@ -356,70 +477,20 @@ def convert(
 
     # ----- milestone-2 HOOKS (NOT converted here) -----
     # vision_model.* / sound_encoder.* / mlp1.* / sound_projection.* are the
-    # multimodal encoders + projectors. They are intentionally LEFT for
-    # milestone 2; a future converter pass will build their target trees from
-    # the vision/sound Flax modules and map them analogously. We only report
-    # their presence so the manifest is honest about what was skipped.
+    # multimodal encoders + projectors. The SOUND namespace is now convertible
+    # via --namespace sound (see convert_sound); vision is still milestone 2.
+    # We report skipped namespaces so the manifest is honest about the LLM pass.
     skipped_ns: dict[str, int] = {}
     for k in hf_all - hf_llm:
         ns = k.split(".")[0]
         skipped_ns[ns] = skipped_ns.get(ns, 0) + 1
     if skipped_ns:
-        print(f"[convert] SKIPPED (milestone 2, multimodal): {skipped_ns}")
+        print(f"[convert] SKIPPED (other namespaces, not the LLM pass): {skipped_ns}")
 
     # (c)-(e) build the param tree leaf-by-leaf.
-    params: dict = {}
-    written = []  # slash paths written
-    unmapped_targets = []  # target leaves with no name-map entry
-    consumed_hf: dict[str, str] = {}  # hf full key -> target that claimed it
-    total_bytes = 0
-
-    for tpath, tshape in targets.items():
-        entry = name_map.get(tpath)
-        if entry is None:
-            # nnx may emit a trailing variable-kind segment on some leaves; the
-            # name map keys to the un-trailed path. Try the trimmed form.
-            trimmed = "/".join(tpath.split("/")[:-1])
-            entry = name_map.get(trimmed)
-        if entry is None:
-            unmapped_targets.append(tpath)
-            continue
-
-        hf = entry["hf"]
-        transform = entry["transform"]
-        rel_names = [hf] if isinstance(hf, str) else list(hf)
-        full_names = [HF_PREFIX + n for n in rel_names]
-
-        # Read source array(s) lazily; record consumption / detect double-claims.
-        arrays = []
-        for fn in full_names:
-            if fn not in store:
-                raise KeyError(
-                    f"target {tpath!r} needs HF tensor {fn!r}, absent from "
-                    f"checkpoint index (shape expected from config: {tshape})"
-                )
-            if fn in consumed_hf:
-                raise ValueError(
-                    f"HF tensor {fn!r} double-claimed by {consumed_hf[fn]!r} and "
-                    f"{tpath!r}"
-                )
-            consumed_hf[fn] = tpath
-            # Dry-run validates name-map membership against the index only; it must
-            # NOT read tensor data (the index-only checkpoint has no shards on disk).
-            if not dry_run:
-                arrays.append(store.get(fn))
-
-        if not dry_run:
-            # apply the documented reshape/transpose, then ASSERT shape, then cast.
-            arr = apply_transform(transform, arrays)
-            assert tuple(arr.shape) == tuple(tshape), (
-                f"{tpath}: converted shape {tuple(arr.shape)} != target {tuple(tshape)} "
-                f"(transform={transform}, sources={full_names})"
-            )
-            arr = arr.astype(cast_dtype)
-            total_bytes += arr.nbytes
-            _insert(params, tpath, arr)
-        written.append(tpath)
+    params, written, unmapped_targets, consumed_hf, total_bytes = _build_params(
+        targets, name_map, store, HF_PREFIX, hf_llm, cast_dtype, dry_run
+    )
 
     # Bijection bookkeeping over language_model.* (mirrors test_name_coverage).
     unconsumed_hf = sorted(hf_llm - set(consumed_hf.keys()))
@@ -433,24 +504,13 @@ def convert(
         print(f"[convert] WARNING: {len(unconsumed_hf)} language_model.* HF tensors "
               f"UNCONSUMED: {unconsumed_hf[:8]}")
 
-    # (f) write Orbax STRAIGHT to the destination (gs:// safe).
     if not dry_run:
-        import orbax.checkpoint as ocp
-
-        dest = _normalize_out(out)
-        print(f"[convert] writing Orbax checkpoint to {dest!r} ...")
-        ckpter = ocp.StandardCheckpointer()
-        # Wrap under "params" so the runtime loads model.init's {"params": ...}
-        # shape. (Loaders auto-classify the nested tree; see playbook.)
-        # force=overwrite lets a re-run replace an existing checkpoint instead of
-        # failing with "Destination ... already exists."
-        ckpter.save(dest, {"params": params}, force=overwrite)
-        ckpter.wait_until_finished()
-        print(f"[convert] WROTE checkpoint to {dest!r}")
+        _write_orbax(params, out, overwrite)
     else:
         print("[convert] DRY RUN: skipped Orbax write")
 
     manifest = {
+        "namespace": "llm",
         "preset": preset,
         "dtype": dtype,
         "n_target_leaves": len(targets),
@@ -463,6 +523,113 @@ def convert(
         "skipped_multimodal_namespaces": skipped_ns,
     }
     return manifest
+
+
+def convert_sound(
+    ckpt_dir: str,
+    out: str,
+    preset: str,
+    dtype: str,
+    dry_run: bool = False,
+    overwrite: bool = False,
+) -> dict:
+    """Target-driven conversion of the SOUND namespace (Parakeet FastConformer
+    encoder + sound projector), mirroring ``convert`` for the LLM.
+
+    The sound tensors live at the HF TOP LEVEL (HF_PREFIX == ""): the encoder
+    body under ``sound_encoder.encoder.*`` and the projector under
+    ``sound_projection.*``. The lone HF sound tensor expected to remain
+    UNCONSUMED is the per-layer ``conv.norm.num_batches_tracked`` buffer (an I64
+    counter, not a param); the manifest asserts it is the ONLY one."""
+    if dtype != "bf16":
+        raise ValueError(
+            f"--dtype {dtype!r} not supported; only 'bf16' (a 30B f32 tree OOMs)."
+        )
+    cast_dtype = BF16
+
+    from jax_nemotron.audio_encoder import hf_sound_name_map, HF_SOUND_PREFIX
+
+    print(f"[convert] SOUND  preset={preset!r}  ckpt_dir={ckpt_dir!r}  out={out!r}")
+
+    # (a) authoritative sound target tree (encoder + projector), no allocation.
+    cfg, targets = build_sound_target_tree(preset)
+    print(f"[convert] sound target tree: {len(targets)} leaves (eval_shape, no alloc)")
+
+    name_map = hf_sound_name_map(cfg)
+
+    # (b) lazy sharded reader; the sound namespace is everything top-level under
+    # sound_encoder.* / sound_projection.*.
+    store = ShardedSafetensors(ckpt_dir)
+    hf_all = set(store.keys())
+    hf_sound = {k for k in hf_all
+                if k.startswith("sound_encoder.") or k.startswith("sound_projection.")}
+    print(f"[convert] checkpoint tensors: {len(hf_all)} total, "
+          f"{len(hf_sound)} under sound_encoder.* / sound_projection.*")
+
+    # (c)-(e) build the param tree.
+    params, written, unmapped_targets, consumed_hf, total_bytes = _build_params(
+        targets, name_map, store, HF_SOUND_PREFIX, hf_sound, cast_dtype, dry_run
+    )
+
+    unconsumed_hf = sorted(hf_sound - set(consumed_hf.keys()))
+
+    # The ONLY sound tensors we expect to leave on the floor are the BatchNorm
+    # num_batches_tracked counters (one per conformer layer). Assert exactly that.
+    expected_unconsumed = sorted(
+        k for k in hf_sound if k.endswith("num_batches_tracked")
+    )
+    unexpected_unconsumed = [k for k in unconsumed_hf if not k.endswith("num_batches_tracked")]
+
+    print(f"[convert] built {len(written)} leaves, ~{total_bytes / 1e9:.3f} GB bf16 "
+          f"in RAM")
+    print(f"[convert] expected-unconsumed (num_batches_tracked): "
+          f"{len(expected_unconsumed)}")
+    if unmapped_targets:
+        print(f"[convert] WARNING: {len(unmapped_targets)} sound target leaves "
+              f"UNMAPPED: {unmapped_targets[:8]}")
+    if unexpected_unconsumed:
+        print(f"[convert] WARNING: {len(unexpected_unconsumed)} UNEXPECTED unconsumed "
+              f"sound tensors: {unexpected_unconsumed[:8]}")
+
+    # num_batches_tracked must be the ONLY expected-unconsumed sound tensor.
+    assert set(unconsumed_hf) == set(expected_unconsumed), (
+        "sound conversion: unconsumed HF tensors must be EXACTLY the "
+        f"num_batches_tracked buffers; got extra {unexpected_unconsumed!r} "
+        f"and/or missing {sorted(set(expected_unconsumed) - set(unconsumed_hf))!r}"
+    )
+
+    if not dry_run:
+        _write_orbax(params, out, overwrite)
+    else:
+        print("[convert] DRY RUN: skipped Orbax write")
+
+    manifest = {
+        "namespace": "sound",
+        "preset": preset,
+        "dtype": dtype,
+        "n_target_leaves": len(targets),
+        "n_written": len(written),
+        "approx_bf16_gb": round(total_bytes / 1e9, 3),
+        "n_hf_sound_tensors": len(hf_sound),
+        "n_consumed_hf": len(consumed_hf),
+        "unmapped_targets": unmapped_targets,
+        "unconsumed_hf": unconsumed_hf,
+        "expected_unconsumed_num_batches_tracked": len(expected_unconsumed),
+    }
+    return manifest
+
+
+def _write_orbax(params: dict, out: str, overwrite: bool) -> None:
+    """(f) write Orbax STRAIGHT to the destination (gs:// safe). Wrap under
+    "params" so the runtime loads model.init's {"params": ...} shape."""
+    import orbax.checkpoint as ocp
+
+    dest = _normalize_out(out)
+    print(f"[convert] writing Orbax checkpoint to {dest!r} ...")
+    ckpter = ocp.StandardCheckpointer()
+    ckpter.save(dest, {"params": params}, force=overwrite)
+    ckpter.wait_until_finished()
+    print(f"[convert] WROTE checkpoint to {dest!r}")
 
 
 # =============================================================================
@@ -480,6 +647,9 @@ def _parse_args(argv=None):
                    help="Destination Orbax dir (local path or gs://bucket/path).")
     p.add_argument("--preset", default="omni_30b",
                    help="Model preset (omni_30b | tiny). Default omni_30b.")
+    p.add_argument("--namespace", default="llm", choices=("llm", "sound"),
+                   help="Which namespace to convert: 'llm' (language_model.*, the "
+                        "default) or 'sound' (sound_encoder.* / sound_projection.*).")
     p.add_argument("--dtype", default="bf16",
                    help="Cast dtype. Only 'bf16' supported (f32 30B tree OOMs).")
     p.add_argument("--dry-run", action="store_true",
@@ -492,7 +662,8 @@ def _parse_args(argv=None):
 
 def main(argv=None):
     args = _parse_args(argv)
-    manifest = convert(
+    convert_fn = convert_sound if args.namespace == "sound" else convert
+    manifest = convert_fn(
         ckpt_dir=args.ckpt_dir,
         out=args.out,
         preset=args.preset,
@@ -502,8 +673,20 @@ def main(argv=None):
     )
     print("\n========== MANIFEST ==========")
     print(json.dumps(manifest, indent=2))
-    # Non-zero exit if the contract is not a full bijection over the LLM backbone.
-    if manifest["unmapped_targets"] or manifest["unconsumed_hf"]:
+    # Non-zero exit if the contract is not a full bijection over the namespace.
+    if manifest["unmapped_targets"]:
+        print(f"[convert] FAILED: {len(manifest['unmapped_targets'])} target leaves "
+              "UNMAPPED (see WARNINGs above)")
+        return 1
+    if args.namespace == "sound":
+        # Sound: every HF sound tensor consumed EXCEPT num_batches_tracked.
+        leftover = [k for k in manifest["unconsumed_hf"]
+                    if not k.endswith("num_batches_tracked")]
+        if leftover:
+            print(f"[convert] FAILED: {len(leftover)} sound tensors unconsumed "
+                  "beyond num_batches_tracked")
+            return 1
+    elif manifest["unconsumed_hf"]:
         print("[convert] FAILED: contract is not a full bijection over "
               "language_model.* (see WARNINGs above)")
         return 1
