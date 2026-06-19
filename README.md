@@ -10,7 +10,7 @@ free Colab/Kaggle TPU (or CPU, via the `tiny` preset).
 ## Quickstart
 
 ```bash
-git clone <this-repo> jax-nemotron
+git clone git@github.com:huckiyang/jax-nemotron.git
 cd jax-nemotron
 
 # CPU JAX venv (jax 0.10.1, flax 0.12.7 — the flax.nnx API)
