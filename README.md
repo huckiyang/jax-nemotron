@@ -2,7 +2,7 @@
 
 <img src="jn.png" alt="JAX Nemotron Logo" width="200"/>
 
-[![Model on HuggingFace](https://img.shields.io/badge/HuggingFace-Nemotron--3--Nano--Omni--30B--A3B--bf16--Orbax-ffd21e?logo=huggingface&logoColor=000)](https://huggingface.co/huckiyang/Nemotron-3-Nano-Omni-30B-A3B-bf16-Orbax)
+[![HuggingFace](https://img.shields.io/badge/HuggingFace-Nemotron--3--Nano--Omni--30B--A3B--bf16--Orbax-ffd21e?logo=huggingface&logoColor=000)](https://huggingface.co/huckiyang/Nemotron-3-Nano-Omni-30B-A3B-bf16-Orbax)
 
 A clean, hackable JAX / Flax-NNX re-implementation of NVIDIA's **Nemotron-3-Nano-Omni** model based on public pytorch model files and paper.
 
